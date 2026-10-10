@@ -23,33 +23,47 @@
 // Runs a fault catalog: by default tests/cpp/io/fault_catalog/ibverbs.yaml, one
 // entry per real-world fault on the ibverbs data path (MORI-IO fault simulation,
 // part 1/N). The YAML file explains each field and the four checks every entry
-// is held to (ends, honest, recovers, alive); this file only runs them. Each
-// entry runs in its own child process, so a crash or a hang in one does not stop
-// the rest.
+// is held to (ends, honest, recovers, alive); this file only runs them.
+//
+// Processes, all on one node:
+//   runner     runs each entry in its own initiator process, so a crash or a
+//              hang in one does not stop the rest, and tabulates the results
+//   initiator  GPU 0 and its closest NIC: issues the transfers
+//   target     GPU 1 and its closest NIC: owns the remote buffer and answers the
+//              initiator over a socketpair (fill, check, notified?, arm, ...)
+// With two NICs the data crosses the wire and the switch, as between two
+// nodes. On a single-GPU machine both ends share GPU 0 and its NIC.
 //
 // Usage: test_fault_injection [id-substring]
 //   MORI_IO_FAULT_CATALOG=<file.yaml> runs another catalog.
-// Needs -DENABLE_IO_FAULT_INJECTION=ON, one active RDMA NIC and one GPU.
+// Needs -DENABLE_IO_FAULT_INJECTION=ON, an active RDMA NIC and a GPU (two of each
+// for the cross-NIC setup).
 
 #include <hip/hip_runtime_api.h>
 #include <netinet/in.h>
 #include <poll.h>
 #include <signal.h>
+#include <sys/prctl.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <cerrno>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <memory>
+#include <optional>
 #include <set>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
 
+#include "mori/application/topology/system.hpp"
 #include "mori/application/utils/check.hpp"
 #include "mori/io/io.hpp"
 #include "mori/utils/flat_yaml.hpp"
@@ -70,6 +84,8 @@ enum class Op {
   Batch,  // BatchWrite of 2 non-adjacent segments, one per QP (qpPerTransfer=2)
 };
 
+enum class Side { Initiator, Target };  // which process the fault is armed in
+
 // One catalog entry; the YAML file documents the fields.
 struct Entry {
   std::string id;
@@ -78,6 +94,7 @@ struct Entry {
   Op op{Op::Write};
   bool notify{false};
   int warmup{0};
+  Side side{Side::Initiator};
 };
 
 std::string CatalogPath() {
@@ -88,8 +105,8 @@ std::string CatalogPath() {
 // Loads and validates a catalog; throws with the file and entry on any mistake,
 // so a typo never silently drops or weakens an entry.
 std::vector<Entry> LoadCatalog(const std::string& path) {
-  const std::set<std::string> kFields = {"id",       "real_world", "rule",
-                                         "transfer", "notify",     "warmup"};
+  const std::set<std::string> kFields = {"id",     "real_world", "rule", "transfer",
+                                         "notify", "warmup",     "side"};
   std::vector<Entry> entries;
   std::set<std::string> ids;
   for (const mori::yaml::FlatMap& raw : mori::yaml::LoadFlatList(path)) {
@@ -118,6 +135,14 @@ std::vector<Entry> LoadCatalog(const std::string& path) {
     long warmup = mori::yaml::GetInt(raw, "warmup", 0, where);
     if (warmup < 0) throw std::runtime_error(where + ": warmup must not be negative");
     e.warmup = static_cast<int>(warmup);
+    std::string side = mori::yaml::GetString(raw, "side", "initiator");
+    if (side == "initiator") {
+      e.side = Side::Initiator;
+    } else if (side == "target") {
+      e.side = Side::Target;
+    } else {
+      throw std::runtime_error(where + ": side must be initiator or target, got '" + side + "'");
+    }
     if (!e.rule.empty()) {
       try {
         ParseFaultRule(e.rule);
@@ -131,15 +156,19 @@ std::vector<Entry> LoadCatalog(const std::string& path) {
 }
 
 /* ---------------------------------------------------------------------------------------------- */
-/*                                         Loopback rig                                           */
+/*                                     Shared by both processes                                   */
 /* ---------------------------------------------------------------------------------------------- */
 
 constexpr size_t kBufBytes = 1 << 20;
 constexpr size_t kSegBytes = 256 << 10;  // Batch: [0, 256K) and [512K, 768K)
 constexpr size_t kSeg2Offset = 512 << 10;
 constexpr int kDeadlineMs = 5000;
-constexpr int kChildTimeoutMs = 60000;
+constexpr int kSetupMs = 30000;  // target start-up: HIP init, engine, buffer
+constexpr int kRpcMs = 10000;
+constexpr int kChildTimeoutMs = 90000;
+constexpr int kInitiatorGpu = 0;
 constexpr const char* kInitiatorKey = "fault_initiator";
+constexpr const char* kTargetKey = "fault_target";
 
 constexpr int kExitPass = 0;
 constexpr int kExitFail = 1;
@@ -172,6 +201,16 @@ const char* CodeName(StatusCode code) {
   }
 }
 
+// The target uses a second GPU, and so a second NIC, when there is one.
+int TargetGpu() {
+  int gpus = 0;
+  if (hipGetDeviceCount(&gpus) != hipSuccess) return kInitiatorGpu;
+  return gpus >= 2 ? 1 : kInitiatorGpu;
+}
+
+// The NIC MORI picks for a buffer on `gpu` (the same topology match it uses).
+std::string NicFor(int gpu) { return mori::application::TopoSystem().MatchGpuAndNic(gpu); }
+
 int GetFreePort() {
   int fd = socket(AF_INET, SOCK_STREAM, 0);
   if (fd < 0) return -1;
@@ -188,40 +227,209 @@ int GetFreePort() {
   return port;
 }
 
+std::unique_ptr<IOEngine> MakeEngine(const std::string& key, const Entry& e) {
+  IOEngineConfig cfg;
+  cfg.host = "127.0.0.1";  // control plane only; data goes over RDMA
+  cfg.port = GetFreePort();
+  if (cfg.port <= 0) throw std::runtime_error("failed to allocate a tcp port");
+  auto engine = std::make_unique<IOEngine>(key, cfg);
+  RdmaBackendConfig rdmaCfg{};
+  rdmaCfg.enableNotification = e.notify;
+  rdmaCfg.notifPerQp = 64;
+  rdmaCfg.qpPerTransfer = e.op == Op::Batch ? 2 : 1;
+  engine->CreateBackend(BackendType::RDMA, rdmaCfg);
+  return engine;
+}
+
 struct GpuBuffer {
   MemoryDesc desc{};
   void* ptr{nullptr};
 
-  explicit GpuBuffer(IOEngine* engine) {
-    HIP_RUNTIME_CHECK(hipSetDevice(0));
+  GpuBuffer(IOEngine* engine, int gpu) {
+    HIP_RUNTIME_CHECK(hipSetDevice(gpu));
     HIP_RUNTIME_CHECK(hipMalloc(&ptr, kBufBytes));
-    desc = engine->RegisterMemory(ptr, kBufBytes, 0, MemoryLocationType::GPU);
+    desc = engine->RegisterMemory(ptr, kBufBytes, gpu, MemoryLocationType::GPU);
+  }
+
+  void Fill(int pattern) {
+    HIP_RUNTIME_CHECK(hipMemset(ptr, pattern, kBufBytes));
+    HIP_RUNTIME_CHECK(hipDeviceSynchronize());
+  }
+
+  // The bytes a transfer of `op` writes all hold `pattern`.
+  bool Holds(Op op, int pattern) {
+    std::vector<unsigned char> host(kBufBytes);
+    HIP_RUNTIME_CHECK(hipMemcpy(host.data(), ptr, kBufBytes, hipMemcpyDeviceToHost));
+    auto filled = [&](size_t off, size_t len) {
+      for (size_t i = off; i < off + len; ++i) {
+        if (host[i] != static_cast<unsigned char>(pattern)) return false;
+      }
+      return true;
+    };
+    if (op == Op::Batch) return filled(0, kSegBytes) && filled(kSeg2Offset, kSegBytes);
+    return filled(0, kBufBytes);
   }
 };
+
+// Length-prefixed messages over the initiator/target socketpair.
+bool SendMsg(int fd, const std::string& msg) {
+  uint32_t len = static_cast<uint32_t>(msg.size());
+  std::string buf(reinterpret_cast<const char*>(&len), sizeof(len));
+  buf += msg;
+  for (size_t off = 0; off < buf.size();) {
+    ssize_t n = send(fd, buf.data() + off, buf.size() - off, MSG_NOSIGNAL);
+    if (n <= 0) return false;
+    off += static_cast<size_t>(n);
+  }
+  return true;
+}
+
+// False on EOF (the peer exited), an error or the timeout (< 0 waits forever).
+bool RecvMsg(int fd, std::string* msg, int timeoutMs) {
+  auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
+  auto readExact = [&](char* dst, size_t len) {
+    for (size_t off = 0; off < len;) {
+      int waitMs = -1;
+      if (timeoutMs >= 0) {
+        auto left = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        deadline - std::chrono::steady_clock::now())
+                        .count();
+        if (left <= 0) return false;
+        waitMs = static_cast<int>(left);
+      }
+      pollfd p{fd, POLLIN, 0};
+      int r = poll(&p, 1, waitMs);
+      if (r < 0 && errno == EINTR) continue;
+      if (r <= 0) return false;
+      ssize_t n = read(fd, dst + off, len - off);
+      if (n <= 0) return false;
+      off += static_cast<size_t>(n);
+    }
+    return true;
+  };
+  uint32_t len = 0;
+  if (!readExact(reinterpret_cast<char*>(&len), sizeof(len))) return false;
+  msg->assign(len, '\0');
+  return len == 0 || readExact(&(*msg)[0], len);
+}
+
+template <typename T>
+std::string Pack(const T& value) {
+  msgpack::sbuffer buf;
+  msgpack::pack(buf, value);
+  return std::string(buf.data(), buf.size());
+}
+
+template <typename T>
+T Unpack(const std::string& bytes) {
+  msgpack::object_handle handle = msgpack::unpack(bytes.data(), bytes.size());
+  return handle.get().as<T>();
+}
+
+/* ---------------------------------------------------------------------------------------------- */
+/*                                        Target process                                          */
+/* ---------------------------------------------------------------------------------------------- */
+
+// Owns the remote engine and buffer and answers the initiator until it says
+// "quit" or goes away. Requests: fill <pattern> | check <op> <pattern> |
+// told <transfer id> <ms> | arm <rule> | disarm | fired | ping.
+int ServeTarget(const Entry& e, int fd) {
+  const int gpu = TargetGpu();
+  auto engine = MakeEngine(kTargetKey, e);
+  GpuBuffer buf(engine.get(), gpu);
+  std::string msg;
+  if (!SendMsg(fd, Pack(engine->GetEngineDesc())) || !SendMsg(fd, Pack(buf.desc)) ||
+      !RecvMsg(fd, &msg, kSetupMs)) {
+    return kExitFail;
+  }
+  engine->RegisterRemoteEngine(Unpack<EngineDesc>(msg));
+  if (!SendMsg(fd, NicFor(gpu) + " " + std::to_string(gpu))) return kExitFail;
+
+  while (RecvMsg(fd, &msg, -1)) {
+    std::istringstream in(msg);
+    std::string cmd;
+    in >> cmd;
+    std::string reply = "ok";
+    if (cmd == "fill") {
+      int pattern = 0;
+      in >> pattern;
+      buf.Fill(pattern);
+    } else if (cmd == "check") {
+      int op = 0, pattern = 0;
+      in >> op >> pattern;
+      reply = buf.Holds(static_cast<Op>(op), pattern) ? "ok" : "no";
+    } else if (cmd == "told") {
+      TransferUniqueId id = 0;
+      int ms = 0;
+      in >> id >> ms;
+      reply = "no";
+      auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(ms);
+      do {
+        TransferStatus inbound;
+        if (engine->PopInboundTransferStatus(kInitiatorKey, id, &inbound)) {
+          reply = "ok";
+          break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      } while (std::chrono::steady_clock::now() < deadline);
+    } else if (cmd == "arm") {
+      std::string rule;
+      in >> rule;
+      FaultInjector::Instance().Arm(ParseFaultRule(rule));
+    } else if (cmd == "disarm") {
+      FaultInjector::Instance().Disarm();
+    } else if (cmd == "fired") {
+      reply = std::to_string(FaultInjector::Instance().Fired());
+    } else if (cmd == "quit") {
+      break;
+    } else if (cmd != "ping") {
+      reply = "unknown request '" + cmd + "'";
+    }
+    if (!SendMsg(fd, reply)) break;
+  }
+  return kExitPass;
+}
+
+/* ---------------------------------------------------------------------------------------------- */
+/*                                       Initiator process                                        */
+/* ---------------------------------------------------------------------------------------------- */
 
 struct Transfer {
   TransferStatus status;
   TransferUniqueId id{0};
   Op op{Op::Write};
-  unsigned char pattern{0};
+  int pattern{0};
 };
 
-// Two engines connected over loopback, one GPU buffer each. Children exit with
-// _Exit, so nothing here is torn down: a faulted engine may not shut down cleanly,
-// and that is not what these checks are about.
-class LoopbackRig {
+// The initiator's engine and buffer, plus the target process it started. The
+// initiator exits with _Exit, so nothing here is torn down: a faulted engine may
+// not shut down cleanly, and that is not what these checks are about. The
+// target is killed with the initiator (PR_SET_PDEATHSIG).
+class PeerRig {
  public:
-  LoopbackRig(bool notify, int qpPerTransfer) : notify_(notify) {
+  explicit PeerRig(const Entry& e) : entry_(e) {
     if (!RdmaBackend::HasActiveDevices()) throw TestSkip("requires an active RDMA device");
     int gpus = 0;
     if (hipGetDeviceCount(&gpus) != hipSuccess || gpus == 0) throw TestSkip("requires a GPU");
+    StartTarget();
 
-    initiator_ = MakeEngine(kInitiatorKey, notify, qpPerTransfer);
-    target_ = MakeEngine("fault_target", notify, qpPerTransfer);
-    initiator_->RegisterRemoteEngine(target_->GetEngineDesc());
-    target_->RegisterRemoteEngine(initiator_->GetEngineDesc());
-    local_ = std::make_unique<GpuBuffer>(initiator_.get());
-    remote_ = std::make_unique<GpuBuffer>(target_.get());
+    engine_ = MakeEngine(kInitiatorKey, e);
+    local_ = std::make_unique<GpuBuffer>(engine_.get(), kInitiatorGpu);
+    std::string engineDesc, memDesc, hello;
+    if (!RecvMsg(fd_, &engineDesc, kSetupMs) || !RecvMsg(fd_, &memDesc, kSetupMs)) {
+      throw std::runtime_error("the target process did not start");
+    }
+    engine_->RegisterRemoteEngine(Unpack<EngineDesc>(engineDesc));
+    remote_ = Unpack<MemoryDesc>(memDesc);
+    if (!SendMsg(fd_, Pack(engine_->GetEngineDesc())) || !RecvMsg(fd_, &hello, kSetupMs)) {
+      throw std::runtime_error("the target process did not finish setup");
+    }
+    std::string targetNic, targetGpu;
+    std::istringstream(hello) >> targetNic >> targetGpu;
+    std::string initiatorNic = NicFor(kInitiatorGpu);
+    std::printf("    topology: initiator GPU %d %s -> target pid %d GPU %s %s (%s)\n",
+                kInitiatorGpu, initiatorNic.c_str(), static_cast<int>(pid_), targetGpu.c_str(),
+                targetNic.c_str(), initiatorNic == targetNic ? "same NIC" : "cross-NIC");
   }
 
   // Starts one transfer with a fresh data pattern in its source and zeros in its destination.
@@ -229,28 +437,31 @@ class LoopbackRig {
     transfers_.push_back(std::make_unique<Transfer>());
     Transfer* t = transfers_.back().get();
     t->op = op;
-    t->id = initiator_->AllocateTransferUniqueId();
-    t->pattern = static_cast<unsigned char>(transfers_.size() % 250 + 1);
-    GpuBuffer* src = op == Op::Read ? remote_.get() : local_.get();
-    HIP_RUNTIME_CHECK(hipMemset(src->ptr, t->pattern, kBufBytes));
-    HIP_RUNTIME_CHECK(hipMemset(Destination(op)->ptr, 0, kBufBytes));
-    HIP_RUNTIME_CHECK(hipDeviceSynchronize());
+    t->id = engine_->AllocateTransferUniqueId();
+    t->pattern = static_cast<int>(transfers_.size() % 250 + 1);
+    if (op == Op::Read) {
+      Ask("fill " + std::to_string(t->pattern));
+      local_->Fill(0);
+    } else {
+      local_->Fill(t->pattern);
+      Ask("fill 0");
+    }
 
     switch (op) {
       case Op::Write:
-        initiator_->Write(local_->desc, 0, remote_->desc, 0, kBufBytes, &t->status, t->id);
+        engine_->Write(local_->desc, 0, remote_, 0, kBufBytes, &t->status, t->id);
         break;
       case Op::Read:
-        initiator_->Read(local_->desc, 0, remote_->desc, 0, kBufBytes, &t->status, t->id);
+        engine_->Read(local_->desc, 0, remote_, 0, kBufBytes, &t->status, t->id);
         break;
       case Op::Batch: {
         MemDescVec local{local_->desc};
-        MemDescVec remote{remote_->desc};
+        MemDescVec remote{remote_};
         BatchSizeVec offsets{{0, kSeg2Offset}};
         BatchSizeVec sizes{{kSegBytes, kSegBytes}};
         TransferStatusPtrVec statuses{&t->status};
         TransferUniqueIdVec ids{t->id};
-        initiator_->BatchWrite(local, offsets, remote, offsets, sizes, statuses, ids);
+        engine_->BatchWrite(local, offsets, remote, offsets, sizes, statuses, ids);
         break;
       }
     }
@@ -259,29 +470,18 @@ class LoopbackRig {
 
   // The transfer's bytes are in its destination.
   bool DataLanded(const Transfer& t) {
-    std::vector<unsigned char> host(kBufBytes);
-    HIP_RUNTIME_CHECK(
-        hipMemcpy(host.data(), Destination(t.op)->ptr, kBufBytes, hipMemcpyDeviceToHost));
-    auto filled = [&](size_t off, size_t len) {
-      for (size_t i = off; i < off + len; ++i) {
-        if (host[i] != t.pattern) return false;
-      }
-      return true;
-    };
-    if (t.op == Op::Batch) return filled(0, kSegBytes) && filled(kSeg2Offset, kSegBytes);
-    return filled(0, kBufBytes);
+    if (t.op == Op::Read) return local_->Holds(t.op, t.pattern);
+    auto reply =
+        Ask("check " + std::to_string(static_cast<int>(t.op)) + " " + std::to_string(t.pattern));
+    return reply && *reply == "ok";
   }
 
   // With notifications off there is nothing to tell the target, so this holds.
   bool TargetTold(const Transfer& t, int timeoutMs) {
-    if (!notify_) return true;
-    auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
-    while (true) {
-      TransferStatus inbound;
-      if (target_->PopInboundTransferStatus(kInitiatorKey, t.id, &inbound)) return true;
-      if (std::chrono::steady_clock::now() >= deadline) return false;
-      std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    }
+    if (!entry_.notify) return true;
+    auto reply =
+        Ask("told " + std::to_string(t.id) + " " + std::to_string(timeoutMs), timeoutMs + kRpcMs);
+    return reply && *reply == "ok";
   }
 
   // SUCCESS within the deadline, data landed, target told.
@@ -302,39 +502,86 @@ class LoopbackRig {
     return true;
   }
 
- private:
-  GpuBuffer* Destination(Op op) { return op == Op::Read ? local_.get() : remote_.get(); }
-
-  static std::unique_ptr<IOEngine> MakeEngine(const std::string& key, bool notify,
-                                              int qpPerTransfer) {
-    IOEngineConfig cfg;
-    cfg.host = "127.0.0.1";
-    cfg.port = GetFreePort();
-    if (cfg.port <= 0) throw std::runtime_error("failed to allocate a tcp port");
-    auto engine = std::make_unique<IOEngine>(key, cfg);
-    RdmaBackendConfig rdmaCfg{};
-    rdmaCfg.enableNotification = notify;
-    rdmaCfg.notifPerQp = 64;
-    rdmaCfg.qpPerTransfer = qpPerTransfer;
-    engine->CreateBackend(BackendType::RDMA, rdmaCfg);
-    return engine;
+  void Arm(const std::string& rule) {
+    if (entry_.side == Side::Initiator) {
+      FaultInjector::Instance().Arm(ParseFaultRule(rule));
+    } else if (!Ask("arm " + rule)) {
+      throw std::runtime_error("could not arm the fault in the target process");
+    }
   }
 
-  bool notify_;
-  std::unique_ptr<IOEngine> initiator_;
-  std::unique_ptr<IOEngine> target_;
+  void Disarm() {
+    FaultInjector::Instance().Disarm();
+    Ask("disarm");
+  }
+
+  // How often the armed side fired; nullopt if that side is gone and cannot say.
+  std::optional<uint64_t> Fired() {
+    if (entry_.side == Side::Initiator) return FaultInjector::Instance().Fired();
+    auto reply = Ask("fired");
+    if (!reply) return std::nullopt;
+    return std::stoull(*reply);
+  }
+
+  // Whether the target process is still up and answering; `why` says what happened if not.
+  bool TargetAlive(std::string* why) {
+    if (Ask("ping")) return true;
+    int status = 0;
+    pid_t done = 0;
+    for (int i = 0; i < 20 && done == 0; ++i) {  // it may still be on its way out
+      done = waitpid(pid_, &status, WNOHANG);
+      if (done == 0) std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    if (done == pid_ && WIFEXITED(status)) {
+      *why = "exited with code " + std::to_string(WEXITSTATUS(status));
+    } else if (done == pid_ && WIFSIGNALED(status)) {
+      *why = std::string("crashed: ") + strsignal(WTERMSIG(status));
+    } else {
+      *why = "stopped answering";
+    }
+    return false;
+  }
+
+ private:
+  void StartTarget() {
+    int sv[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) throw std::runtime_error("socketpair failed");
+    std::string fdArg = std::to_string(sv[1]);  // built before fork: the child only execs
+    pid_ = fork();
+    if (pid_ < 0) throw std::runtime_error("fork failed");
+    if (pid_ == 0) {
+      close(sv[0]);
+      prctl(PR_SET_PDEATHSIG, SIGKILL);
+      execl("/proc/self/exe", "test_fault_injection", "--target", entry_.id.c_str(), fdArg.c_str(),
+            static_cast<char*>(nullptr));
+      _exit(127);
+    }
+    close(sv[1]);
+    fd_ = sv[0];
+  }
+
+  // One request to the target; nullopt once it is gone or does not answer in time.
+  // After a miss the channel is out of step, so every later request misses too.
+  std::optional<std::string> Ask(const std::string& request, int timeoutMs = kRpcMs) {
+    std::string reply;
+    if (!targetGone_ && SendMsg(fd_, request) && RecvMsg(fd_, &reply, timeoutMs)) return reply;
+    targetGone_ = true;
+    return std::nullopt;
+  }
+
+  const Entry& entry_;
+  pid_t pid_{-1};
+  int fd_{-1};
+  bool targetGone_{false};
+  std::unique_ptr<IOEngine> engine_;
   std::unique_ptr<GpuBuffer> local_;
-  std::unique_ptr<GpuBuffer> remote_;
+  MemoryDesc remote_{};
   std::vector<std::unique_ptr<Transfer>> transfers_;  // MORI keeps pointers to their statuses
 };
 
-/* ---------------------------------------------------------------------------------------------- */
-/*                                     One entry (child process)                                  */
-/* ---------------------------------------------------------------------------------------------- */
-
-// Prints "RESULT ends=<0|1> honest=<0|1> recovers=<0|1>" for the parent to tabulate.
+// Prints "RESULT ends=<0|1> honest=<0|1> recovers=<0|1> target=<0|1>" for the runner.
 int RunEntry(const Entry& e) {
-  LoopbackRig rig(e.notify, e.op == Op::Batch ? 2 : 1);
+  PeerRig rig(e);
   std::string why;
   for (int i = 0; i < e.warmup; ++i) {
     if (!rig.Completes(rig.Start(e.op), &why)) {
@@ -344,7 +591,7 @@ int RunEntry(const Entry& e) {
   }
 
   const bool faulted = !e.rule.empty();
-  if (faulted) FaultInjector::Instance().Arm(ParseFaultRule(e.rule));
+  if (faulted) rig.Arm(e.rule);
 
   Transfer* t = rig.Start(e.op);
   StatusCode code = t->status.WaitFor(kDeadlineMs);
@@ -355,9 +602,9 @@ int RunEntry(const Entry& e) {
   }
   std::printf("    faulted transfer: %s %s\n", CodeName(code), t->status.Message().c_str());
 
-  uint64_t fired = FaultInjector::Instance().Fired();
-  FaultInjector::Instance().Disarm();
-  if (faulted && fired == 0) {
+  std::optional<uint64_t> fired = faulted ? rig.Fired() : std::optional<uint64_t>(0);
+  rig.Disarm();
+  if (faulted && fired && *fired == 0) {
     std::printf("    the fault never fired: the entry does not exercise its rule\n");
     return kExitFail;
   }
@@ -365,8 +612,12 @@ int RunEntry(const Entry& e) {
   bool recovers = rig.Completes(rig.Start(e.op), &why);
   if (!recovers) std::printf("    after the fault cleared: %s\n", why.c_str());
 
-  std::printf("RESULT ends=%d honest=%d recovers=%d\n", ends, honest, recovers);
-  return ends && honest && recovers ? kExitPass : kExitFail;
+  bool targetAlive = rig.TargetAlive(&why);
+  if (!targetAlive) std::printf("    target process: %s\n", why.c_str());
+
+  std::printf("RESULT ends=%d honest=%d recovers=%d target=%d\n", ends, honest, recovers,
+              targetAlive);
+  return ends && honest && recovers && targetAlive ? kExitPass : kExitFail;
 }
 
 /* ---------------------------------------------------------------------------------------------- */
@@ -375,13 +626,13 @@ int RunEntry(const Entry& e) {
 
 struct Outcome {
   enum { Pass, Fail, Skip } verdict{Fail};
-  // -1 = not reached (the child crashed or hung before reporting)
-  int ends{-1}, honest{-1}, recovers{-1};
+  // -1 = not reached (the initiator crashed or hung before reporting)
+  int ends{-1}, honest{-1}, recovers{-1}, target{-1};
   bool alive{true};
   std::string note;
 };
 
-// Runs one entry in a child process, echoing its output, and reads back its result.
+// Runs one entry in an initiator process, echoing its output, and reads back its result.
 Outcome RunChild(const char* self, const Entry& e) {
   Outcome out;
   int fds[2];
@@ -405,11 +656,11 @@ Outcome RunChild(const char* self, const Entry& e) {
     if (poll(&p, 1, 100) > 0) {
       char buf[4096];
       ssize_t n = read(fds[0], buf, sizeof(buf));
-      if (n <= 0) break;  // child closed stdout: exited
+      if (n <= 0) break;  // both processes closed stdout: exited
       text.append(buf, n);
     }
     if (std::chrono::steady_clock::now() >= deadline) {
-      kill(pid, SIGKILL);
+      kill(pid, SIGKILL);  // the target follows (PR_SET_PDEATHSIG)
       timedOut = true;
       break;
     }
@@ -424,8 +675,8 @@ Outcome RunChild(const char* self, const Entry& e) {
     if (end == std::string::npos) end = text.size();
     std::string line = text.substr(start, end - start);
     if (line.rfind("RESULT ", 0) == 0) {
-      std::sscanf(line.c_str(), "RESULT ends=%d honest=%d recovers=%d", &out.ends, &out.honest,
-                  &out.recovers);
+      std::sscanf(line.c_str(), "RESULT ends=%d honest=%d recovers=%d target=%d", &out.ends,
+                  &out.honest, &out.recovers, &out.target);
     } else if (!line.empty()) {
       std::printf("%s\n", line.c_str());
     }
@@ -437,13 +688,16 @@ Outcome RunChild(const char* self, const Entry& e) {
     out.note = "killed after " + std::to_string(kChildTimeoutMs / 1000) + " s";
   } else if (WIFSIGNALED(wstatus)) {
     out.alive = false;
-    out.note = std::string("crashed: ") + strsignal(WTERMSIG(wstatus));
+    out.note = std::string("initiator crashed: ") + strsignal(WTERMSIG(wstatus));
   } else if (WEXITSTATUS(wstatus) == kExitSkip) {
     out.verdict = Outcome::Skip;
     return out;
   } else if (WEXITSTATUS(wstatus) != kExitPass && WEXITSTATUS(wstatus) != kExitFail) {
     out.alive = false;
-    out.note = "process exited with code " + std::to_string(WEXITSTATUS(wstatus));
+    out.note = "initiator exited with code " + std::to_string(WEXITSTATUS(wstatus));
+  } else if (out.target == 0) {
+    out.alive = false;
+    out.note = "target process died";
   }
   if (out.alive && WEXITSTATUS(wstatus) == kExitPass) out.verdict = Outcome::Pass;
   return out;
@@ -468,6 +722,22 @@ void CheckParser() {
   }
 }
 
+// Runs `body` as a child role: line-buffered output, no teardown on the way out.
+[[noreturn]] void RunRole(const std::function<int()>& body) {
+  setvbuf(stdout, nullptr, _IOLBF, 0);  // keep what was printed if the process crashes
+  int rc = kExitFail;
+  try {
+    rc = body();
+  } catch (const TestSkip& ex) {
+    std::printf("    skipped: %s\n", ex.what());
+    rc = kExitSkip;
+  } catch (const std::exception& ex) {
+    std::printf("    error: %s\n", ex.what());
+  }
+  std::fflush(stdout);
+  std::_Exit(rc);  // skip teardown: a faulted engine may never shut down
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -475,6 +745,8 @@ int main(int argc, char** argv) {
   // "armed"/"injected" warnings visible unless the caller chose a level.
   setenv("MORI_IO_LOG_LEVEL", "warn", /*overwrite=*/0);
   SetLogLevel("warn");
+  // Both ends are on one node; keep every transfer on RDMA, never GPU-to-GPU XGMI.
+  setenv("MORI_DISABLE_AUTO_XGMI", "1", /*overwrite=*/1);
 
   const std::string path = CatalogPath();
   std::vector<Entry> catalog;
@@ -484,23 +756,21 @@ int main(int argc, char** argv) {
     std::printf("[FAIL] catalog: %s\n", ex.what());
     return 1;
   }
+  auto find = [&](const char* id) -> const Entry* {
+    for (const Entry& e : catalog) {
+      if (e.id == id) return &e;
+    }
+    return nullptr;
+  };
 
   if (argc == 3 && std::strcmp(argv[1], "--entry") == 0) {
-    setvbuf(stdout, nullptr, _IOLBF, 0);  // keep what was printed if the entry crashes
-    int rc = kExitFail;
-    for (const Entry& e : catalog) {
-      if (e.id != argv[2]) continue;
-      try {
-        rc = RunEntry(e);
-      } catch (const TestSkip& ex) {
-        std::printf("    skipped: %s\n", ex.what());
-        rc = kExitSkip;
-      } catch (const std::exception& ex) {
-        std::printf("    error: %s\n", ex.what());
-      }
-    }
-    std::fflush(stdout);
-    std::_Exit(rc);  // skip teardown: a faulted engine may never shut down
+    const Entry* e = find(argv[2]);
+    RunRole([&] { return e != nullptr ? RunEntry(*e) : kExitFail; });
+  }
+  if (argc == 4 && std::strcmp(argv[1], "--target") == 0) {
+    const Entry* e = find(argv[2]);
+    int fd = std::atoi(argv[3]);
+    RunRole([&] { return e != nullptr ? ServeTarget(*e, fd) : kExitFail; });
   }
 
   const std::string filter = argc > 1 ? argv[1] : "";
@@ -516,8 +786,9 @@ int main(int argc, char** argv) {
   std::vector<std::pair<const Entry*, Outcome>> results;
   for (const Entry& e : catalog) {
     if (e.id.find(filter) == std::string::npos) continue;
-    std::printf("---- %s: %s [%s]\n", e.id.c_str(), e.realWorld.c_str(),
-                e.rule.empty() ? "no fault" : e.rule.c_str());
+    std::printf("---- %s: %s [%s%s]\n", e.id.c_str(), e.realWorld.c_str(),
+                e.rule.empty() ? "no fault" : e.rule.c_str(),
+                e.side == Side::Target ? ", in target" : "");
     std::fflush(stdout);
     results.emplace_back(&e, RunChild("/proc/self/exe", e));
   }

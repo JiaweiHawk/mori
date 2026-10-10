@@ -8,7 +8,11 @@
 #   recovers  once the fault clears, a new transfer between the same engines succeeds
 #   alive     the process neither exits nor crashes
 # The checks describe the behavior we want, not today's: a failing entry is an
-# open bug for a follow-up fix.
+# open bug for a follow-up fix. "alive" covers both processes below.
+#
+# Each entry runs two processes on one node: the initiator on GPU 0 and the
+# target on GPU 1, each using the NIC closest to its GPU, so the data crosses
+# the wire and the switch as between two nodes.
 #
 # Fields:
 #   id          <fault kind>.<what it hits>[.<when>], unique
@@ -21,6 +25,8 @@
 #               (default false)
 #   warmup      clean transfers before the fault is armed; 0 arms it before the
 #               engines connect (default 0)
+#   side        initiator | target: the process the fault is armed in; the
+#               other one runs fault-free (default initiator)
 
 - id: none.write
   real_world: no fault (baseline)
@@ -52,11 +58,12 @@
   notify: true
 
 - id: post_recv_fail.repost
-  real_world: re-posting a used receive fails mid-run
+  real_world: target fails to re-post a used receive mid-run
   rule: post_recv_fail
   transfer: write
   notify: true
   warmup: 1
+  side: target
 
 # ---- Error completion: the NIC reports the WR failed and moves the QP to ERR ----
 
@@ -131,6 +138,7 @@
   rule: cqe_drop:op=recv
   transfer: write
   notify: true
+  side: target
 
 # ---- QP error: the QP dies (QP_FATAL, NIC reset) and every WR on it flushes ----
 
