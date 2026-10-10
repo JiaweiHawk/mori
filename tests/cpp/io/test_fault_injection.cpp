@@ -20,21 +20,16 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-// Fault catalog for the ibverbs data path (MORI-IO fault simulation, part 1/N).
-//
-// Each entry is one real-world failure written as a FaultRule, plus the transfer
-// it hits. Every entry is held to the same four checks:
-//   ends      the faulted transfer reaches SUCCESS or an error within kDeadlineMs
-//   honest    it reports SUCCESS only if the data landed and, with notifications
-//             on, the target was told
-//   recovers  once the fault clears, a new transfer between the same engines succeeds
-//   alive     the process neither exits nor crashes
-// The checks describe the behavior we want, not today's: a failing entry is an
-// open bug for a follow-up fix. Each entry runs in its own child process, so a
-// crash or a hang in one does not stop the rest.
+// Runs a fault catalog: by default tests/cpp/io/fault_catalog/ibverbs.yaml, one
+// entry per real-world fault on the ibverbs data path (MORI-IO fault simulation,
+// part 1/N). The YAML file explains each field and the four checks every entry
+// is held to (ends, honest, recovers, alive); this file only runs them. Each
+// entry runs in its own child process, so a crash or a hang in one does not stop
+// the rest.
 //
 // Usage: test_fault_injection [id-substring]
-// Needs -DENABLE_IO_FAULT_INJECTION=ON, one active RDMA NIC and one GPU.
+//   MORI_IO_FAULT_CATALOG=<file.yaml> runs another catalog.
+// Needs -DENABLE_IO_FAULT_INJECTION=ON, yaml-cpp, one active RDMA NIC and one GPU.
 
 #include <hip/hip_runtime_api.h>
 #include <netinet/in.h>
@@ -43,12 +38,14 @@
 #include <sys/socket.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include <yaml-cpp/yaml.h>
 
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -73,66 +70,72 @@ enum class Op {
   Batch,  // BatchWrite of 2 non-adjacent segments, one per QP (qpPerTransfer=2)
 };
 
+// One catalog entry; the YAML file documents the fields.
 struct Entry {
-  const char* id;         // <fault kind>.<what it hits>[.<when>]
-  const char* realWorld;  // what this stands for in production
-  const char* rule;       // FaultRule spec (see fault_injector.hpp); "" = no fault
-  Op op;
-  bool notify;  // MORI notifications on: a SEND/RECV after the data tells the target
-  int warmup;   // clean transfers before the fault is armed (0 = arm before connecting)
+  std::string id;
+  std::string realWorld;
+  std::string rule;  // empty = no fault
+  Op op{Op::Write};
+  bool notify{false};
+  int warmup{0};
 };
 
-const Entry kCatalog[] = {
-    {"none.write", "no fault (baseline)", "", Op::Write, true, 0},
+std::string CatalogPath() {
+  const char* path = std::getenv("MORI_IO_FAULT_CATALOG");
+  return path != nullptr && path[0] != '\0' ? path : MORI_IO_FAULT_CATALOG_DEFAULT;
+}
 
-    // Post fails: ibv_post_send / ibv_post_recv returns an error.
-    {"post_send_fail.write", "SQ full or driver rejects the post", "post_send_fail:value=12",
-     Op::Write, false, 0},
-    {"post_send_fail.batch.second_qp", "post fails on QP 2 after QP 1 already posted",
-     "post_send_fail:skip=1", Op::Batch, false, 0},
-    {"post_send_fail.notify", "data posted, then the notification post fails",
-     "post_send_fail:skip=1", Op::Write, true, 0},
-    {"post_recv_fail.connect", "pre-posting receives fails while connecting", "post_recv_fail",
-     Op::Write, true, 0},
-    {"post_recv_fail.repost", "re-posting a used receive fails mid-run", "post_recv_fail",
-     Op::Write, true, 1},
+// Loads and validates a catalog; throws with the file and entry on any mistake,
+// so a typo never silently drops or weakens an entry.
+std::vector<Entry> LoadCatalog(const std::string& path) {
+  const std::set<std::string> kFields = {"id",       "real_world", "rule",
+                                         "transfer", "notify",     "warmup"};
+  YAML::Node root = YAML::LoadFile(path);
+  if (!root.IsSequence()) throw std::runtime_error(path + ": expected a list of entries");
 
-    // Error completion: the NIC reports the WR failed and moves the QP to ERR.
-    {"cqe_error.write.retry_exc", "link down or peer gone during a write",
-     "cqe_error:op=write:value=retry_exc", Op::Write, false, 0},
-    {"cqe_error.write.retry_exc.mid_run", "same, after 10 good transfers",
-     "cqe_error:op=write:value=retry_exc", Op::Write, false, 10},
-    {"cqe_error.read.retry_exc", "link down or peer gone during a read",
-     "cqe_error:op=read:value=retry_exc", Op::Read, false, 0},
-    {"cqe_error.write.rem_access", "stale rkey: peer deregistered the memory",
-     "cqe_error:op=write:value=rem_access", Op::Write, false, 0},
-    {"cqe_error.read.rem_op", "peer rejected the operation", "cqe_error:op=read:value=rem_op",
-     Op::Read, false, 0},
-    {"cqe_error.write.loc_prot", "local buffer deregistered under an in-flight write",
-     "cqe_error:op=write:value=loc_prot", Op::Write, false, 0},
-    {"cqe_error.write.fatal", "NIC internal error on one WR", "cqe_error:op=write:value=fatal",
-     Op::Write, false, 0},
-    {"cqe_error.batch.one_qp", "one of two QPs fails mid-batch", "cqe_error:op=write", Op::Batch,
-     false, 0},
-    // Initiator side only: the injected error lands after the real SEND was
-    // delivered, so the target is still told. cqe_drop.notify.recv covers the target side.
-    {"cqe_error.notify.rnr", "target stopped re-posting receives (RNR retries exhausted)",
-     "cqe_error:op=send:value=rnr_retry_exc", Op::Write, true, 0},
+  std::vector<Entry> entries;
+  std::set<std::string> ids;
+  for (size_t i = 0; i < root.size(); ++i) {
+    const YAML::Node& node = root[i];
+    std::string where = path + ": entry " + std::to_string(i + 1);
+    if (!node.IsMap()) throw std::runtime_error(where + ": expected a map");
+    for (const auto& field : node) {
+      std::string key = field.first.as<std::string>();
+      if (kFields.count(key) == 0)
+        throw std::runtime_error(where + ": unknown field '" + key + "'");
+    }
+    if (!node["id"]) throw std::runtime_error(where + ": missing 'id'");
 
-    // Lost completion: the WR finishes but its CQE never arrives.
-    {"cqe_drop.write", "write completion lost", "cqe_drop:op=write", Op::Write, false, 0},
-    {"cqe_drop.read", "read completion lost", "cqe_drop:op=read", Op::Read, false, 0},
-    {"cqe_drop.batch.one_qp", "one QP's completion lost in a batch", "cqe_drop:op=write", Op::Batch,
-     false, 0},
-    {"cqe_drop.notify.recv", "target loses the notification completion", "cqe_drop:op=recv",
-     Op::Write, true, 0},
-
-    // QP error: the QP dies (QP_FATAL, NIC reset) and every WR on it flushes.
-    {"qp_error.write", "QP dies before the first write", "qp_error", Op::Write, false, 0},
-    {"qp_error.write.mid_run", "QP dies after 10 good transfers", "qp_error", Op::Write, false, 10},
-    {"qp_error.read", "QP dies before a read", "qp_error", Op::Read, false, 0},
-    {"qp_error.batch.one_qp", "one of two QPs dies", "qp_error", Op::Batch, false, 0},
-};
+    Entry e;
+    e.id = node["id"].as<std::string>();
+    where += " (" + e.id + ")";
+    if (!ids.insert(e.id).second) throw std::runtime_error(where + ": duplicate id");
+    e.realWorld = node["real_world"].as<std::string>("");
+    e.rule = node["rule"].as<std::string>("");
+    std::string transfer = node["transfer"].as<std::string>("write");
+    if (transfer == "write") {
+      e.op = Op::Write;
+    } else if (transfer == "read") {
+      e.op = Op::Read;
+    } else if (transfer == "batch") {
+      e.op = Op::Batch;
+    } else {
+      throw std::runtime_error(where + ": transfer must be write, read or batch, got '" + transfer +
+                               "'");
+    }
+    e.notify = node["notify"].as<bool>(false);
+    e.warmup = node["warmup"].as<int>(0);
+    if (!e.rule.empty()) {
+      try {
+        ParseFaultRule(e.rule);
+      } catch (const std::invalid_argument& ex) {
+        throw std::runtime_error(where + ": " + ex.what());
+      }
+    }
+    entries.push_back(std::move(e));
+  }
+  return entries;
+}
 
 /* ---------------------------------------------------------------------------------------------- */
 /*                                         Loopback rig                                           */
@@ -347,7 +350,7 @@ int RunEntry(const Entry& e) {
     }
   }
 
-  const bool faulted = e.rule[0] != '\0';
+  const bool faulted = !e.rule.empty();
   if (faulted) FaultInjector::Instance().Arm(ParseFaultRule(e.rule));
 
   Transfer* t = rig.Start(e.op);
@@ -396,7 +399,7 @@ Outcome RunChild(const char* self, const Entry& e) {
     dup2(fds[1], STDOUT_FILENO);
     close(fds[0]);
     close(fds[1]);
-    execl(self, self, "--entry", e.id, static_cast<char*>(nullptr));
+    execl(self, self, "--entry", e.id.c_str(), static_cast<char*>(nullptr));
     _exit(127);
   }
   close(fds[1]);
@@ -456,9 +459,6 @@ Outcome RunChild(const char* self, const Entry& e) {
 const char* Mark(int v) { return v < 0 ? "-" : v ? "ok" : "FAIL"; }
 
 void CheckParser() {
-  for (const Entry& e : kCatalog) {
-    if (e.rule[0] != '\0') ParseFaultRule(e.rule);  // throws on a bad catalog rule
-  }
   for (const char* bad : {"no_such_kind", "cqe_drop:skip", "cqe_drop:bogus=1", "qp_error:skip=x"}) {
     bool threw = false;
     try {
@@ -483,11 +483,20 @@ int main(int argc, char** argv) {
   setenv("MORI_IO_LOG_LEVEL", "warn", /*overwrite=*/0);
   SetLogLevel("warn");
 
+  const std::string path = CatalogPath();
+  std::vector<Entry> catalog;
+  try {
+    catalog = LoadCatalog(path);
+  } catch (const std::exception& ex) {
+    std::printf("[FAIL] catalog: %s\n", ex.what());
+    return 1;
+  }
+
   if (argc == 3 && std::strcmp(argv[1], "--entry") == 0) {
     setvbuf(stdout, nullptr, _IOLBF, 0);  // keep what was printed if the entry crashes
     int rc = kExitFail;
-    for (const Entry& e : kCatalog) {
-      if (std::strcmp(e.id, argv[2]) != 0) continue;
+    for (const Entry& e : catalog) {
+      if (e.id != argv[2]) continue;
       try {
         rc = RunEntry(e);
       } catch (const TestSkip& ex) {
@@ -501,19 +510,21 @@ int main(int argc, char** argv) {
     std::_Exit(rc);  // skip teardown: a faulted engine may never shut down
   }
 
-  const char* filter = argc > 1 ? argv[1] : "";
+  const std::string filter = argc > 1 ? argv[1] : "";
   try {
     CheckParser();
-    std::printf("[PASS] parser accepts every catalog rule and rejects malformed ones\n");
+    std::printf("[PASS] parser rejects malformed rules\n");
   } catch (const std::exception& ex) {
     std::printf("[FAIL] parser: %s\n", ex.what());
     return 1;
   }
+  std::printf("catalog: %s (%zu entries)\n", path.c_str(), catalog.size());
 
   std::vector<std::pair<const Entry*, Outcome>> results;
-  for (const Entry& e : kCatalog) {
-    if (std::strstr(e.id, filter) == nullptr) continue;
-    std::printf("---- %s: %s [%s]\n", e.id, e.realWorld, e.rule[0] ? e.rule : "no fault");
+  for (const Entry& e : catalog) {
+    if (e.id.find(filter) == std::string::npos) continue;
+    std::printf("---- %s: %s [%s]\n", e.id.c_str(), e.realWorld.c_str(),
+                e.rule.empty() ? "no fault" : e.rule.c_str());
     std::fflush(stdout);
     results.emplace_back(&e, RunChild("/proc/self/exe", e));
   }
@@ -527,7 +538,7 @@ int main(int argc, char** argv) {
                                                        : "FAIL";
     failed += o.verdict == Outcome::Fail;
     skipped += o.verdict == Outcome::Skip;
-    std::printf("%-36s %-6s %-6s %-8s %-6s %s%s%s\n", e->id, Mark(o.ends), Mark(o.honest),
+    std::printf("%-36s %-6s %-6s %-8s %-6s %s%s%s\n", e->id.c_str(), Mark(o.ends), Mark(o.honest),
                 Mark(o.recovers), o.alive ? "ok" : "FAIL", verdict, o.note.empty() ? "" : "  ",
                 o.note.c_str());
   }

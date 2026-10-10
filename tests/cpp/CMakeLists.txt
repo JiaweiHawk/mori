@@ -82,11 +82,19 @@ if(BUILD_IO)
   target_link_libraries(test_transfer_wait mori_application mori_io)
 
   if(ENABLE_IO_FAULT_INJECTION)
+    # The fault catalog is YAML; yaml-cpp is needed only by this opt-in test.
+    find_package(yaml-cpp REQUIRED)
     add_executable(test_fault_injection io/test_fault_injection.cpp)
     target_include_directories(test_fault_injection
                                PUBLIC ${CMAKE_SOURCE_DIR}/include)
     target_include_directories(test_fault_injection PUBLIC ${CMAKE_SOURCE_DIR})
-    target_link_libraries(test_fault_injection mori_application mori_io)
+    target_compile_definitions(
+      test_fault_injection
+      PRIVATE
+        MORI_IO_FAULT_CATALOG_DEFAULT="${CMAKE_CURRENT_SOURCE_DIR}/io/fault_catalog/ibverbs.yaml"
+    )
+    target_link_libraries(test_fault_injection mori_application mori_io
+                          yaml-cpp)
   endif()
 
   add_executable(test_peer_failure io/test_peer_failure.cpp)
