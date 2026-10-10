@@ -39,13 +39,10 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-#include <cctype>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <fstream>
-#include <map>
 #include <memory>
 #include <set>
 #include <stdexcept>
@@ -55,6 +52,7 @@
 
 #include "mori/application/utils/check.hpp"
 #include "mori/io/io.hpp"
+#include "mori/utils/flat_yaml.hpp"
 #include "src/io/rdma/backend_impl.hpp"
 #include "src/io/rdma/fault_injector.hpp"
 
@@ -87,76 +85,6 @@ std::string CatalogPath() {
   return path != nullptr && path[0] != '\0' ? path : MORI_IO_FAULT_CATALOG_DEFAULT;
 }
 
-std::string Trim(const std::string& s) {
-  size_t b = s.find_first_not_of(' ');
-  size_t e = s.find_last_not_of(' ');
-  return b == std::string::npos ? "" : s.substr(b, e - b + 1);
-}
-
-// Reads a value: 'single' or "double" quoted (no escapes), or plain up to a " #" comment.
-std::string ParseScalar(const std::string& raw, const std::string& where) {
-  std::string v = Trim(raw);
-  if (!v.empty() && (v[0] == '"' || v[0] == '\'')) {
-    size_t close = v.find(v[0], 1);
-    std::string rest = close == std::string::npos ? "" : Trim(v.substr(close + 1));
-    if (close == std::string::npos || (!rest.empty() && rest[0] != '#')) {
-      throw std::runtime_error(where + ": unterminated quote or text after a quoted value");
-    }
-    return v.substr(1, close - 1);
-  }
-  size_t comment = v.find(" #");
-  if (comment != std::string::npos) v = Trim(v.substr(0, comment));
-  if (v.empty())
-    throw std::runtime_error(where + ": missing value (nested maps are not supported)");
-  if (std::strchr("[{&*!|>", v[0]) != nullptr || v.find(": ") != std::string::npos) {
-    throw std::runtime_error(where + ": unsupported value '" + v +
-                             "' (quote it if it contains ': ')");
-  }
-  return v;
-}
-
-// The catalog is read by hand, so the test needs no YAML library. It accepts a
-// small subset of YAML, a list of flat maps:
-//   - key: value      starts an entry (at column 0)
-//     key: value      continues it (indented)
-//   # comments and blank lines
-// Anything else (nesting, flow syntax, multi-line values, tabs) is rejected with
-// its line number, so the file stays valid YAML for any other tool.
-using RawEntry = std::map<std::string, std::string>;
-
-std::vector<RawEntry> ReadFlatYamlList(const std::string& path) {
-  std::ifstream in(path);
-  if (!in) throw std::runtime_error(path + ": cannot open");
-  std::vector<RawEntry> list;
-  std::string line;
-  for (int lineNo = 1; std::getline(in, line); ++lineNo) {
-    std::string where = path + ":" + std::to_string(lineNo);
-    if (!line.empty() && line.back() == '\r') line.pop_back();
-    if (line.find('\t') != std::string::npos) throw std::runtime_error(where + ": tab character");
-    std::string body = Trim(line);
-    if (body.empty() || body[0] == '#') continue;
-
-    if (line.rfind("- ", 0) == 0) {
-      list.emplace_back();
-      body = Trim(line.substr(2));
-    } else if (line[0] != ' ' || list.empty()) {
-      throw std::runtime_error(where + ": expected '- key: value' or an indented 'key: value'");
-    }
-    size_t colon = body.find(':');
-    bool keyOk = colon != std::string::npos && colon > 0 &&
-                 (colon + 1 == body.size() || body[colon + 1] == ' ');
-    for (size_t i = 0; keyOk && i < colon; ++i) {
-      keyOk = std::isalnum(static_cast<unsigned char>(body[i])) || body[i] == '_';
-    }
-    if (!keyOk) throw std::runtime_error(where + ": expected 'key: value'");
-    std::string key = body.substr(0, colon);
-    if (!list.back().emplace(key, ParseScalar(body.substr(colon + 1), where)).second) {
-      throw std::runtime_error(where + ": duplicate field '" + key + "'");
-    }
-  }
-  return list;
-}
-
 // Loads and validates a catalog; throws with the file and entry on any mistake,
 // so a typo never silently drops or weakens an entry.
 std::vector<Entry> LoadCatalog(const std::string& path) {
@@ -164,26 +92,18 @@ std::vector<Entry> LoadCatalog(const std::string& path) {
                                          "transfer", "notify",     "warmup"};
   std::vector<Entry> entries;
   std::set<std::string> ids;
-  for (const RawEntry& raw : ReadFlatYamlList(path)) {
+  for (const mori::yaml::FlatMap& raw : mori::yaml::LoadFlatList(path)) {
     std::string where = path + ": entry " + std::to_string(entries.size() + 1);
-    for (const auto& field : raw) {
-      if (kFields.count(field.first) == 0) {
-        throw std::runtime_error(where + ": unknown field '" + field.first + "'");
-      }
-    }
-    auto get = [&](const char* key, const std::string& fallback) {
-      auto it = raw.find(key);
-      return it == raw.end() ? fallback : it->second;
-    };
+    mori::yaml::CheckKeys(raw, kFields, where);
 
     Entry e;
-    e.id = get("id", "");
+    e.id = mori::yaml::GetString(raw, "id");
     if (e.id.empty()) throw std::runtime_error(where + ": missing 'id'");
     where += " (" + e.id + ")";
     if (!ids.insert(e.id).second) throw std::runtime_error(where + ": duplicate id");
-    e.realWorld = get("real_world", "");
-    e.rule = get("rule", "");
-    std::string transfer = get("transfer", "write");
+    e.realWorld = mori::yaml::GetString(raw, "real_world");
+    e.rule = mori::yaml::GetString(raw, "rule");
+    std::string transfer = mori::yaml::GetString(raw, "transfer", "write");
     if (transfer == "write") {
       e.op = Op::Write;
     } else if (transfer == "read") {
@@ -194,19 +114,10 @@ std::vector<Entry> LoadCatalog(const std::string& path) {
       throw std::runtime_error(where + ": transfer must be write, read or batch, got '" + transfer +
                                "'");
     }
-    std::string notify = get("notify", "false");
-    if (notify != "true" && notify != "false") {
-      throw std::runtime_error(where + ": notify must be true or false, got '" + notify + "'");
-    }
-    e.notify = notify == "true";
-    std::string warmup = get("warmup", "0");
-    char* end = nullptr;
-    long n = std::strtol(warmup.c_str(), &end, 10);
-    if (end == warmup.c_str() || *end != '\0' || n < 0) {
-      throw std::runtime_error(where + ": warmup must be a non-negative integer, got '" + warmup +
-                               "'");
-    }
-    e.warmup = static_cast<int>(n);
+    e.notify = mori::yaml::GetBool(raw, "notify", false, where);
+    long warmup = mori::yaml::GetInt(raw, "warmup", 0, where);
+    if (warmup < 0) throw std::runtime_error(where + ": warmup must not be negative");
+    e.warmup = static_cast<int>(warmup);
     if (!e.rule.empty()) {
       try {
         ParseFaultRule(e.rule);
